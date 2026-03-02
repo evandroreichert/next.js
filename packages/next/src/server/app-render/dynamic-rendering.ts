@@ -298,6 +298,28 @@ export function abortOnSynchronousPlatformIOAccess(
 }
 
 /**
+ * Like abortOnSynchronousPlatformIOAccess but also throws to interrupt the
+ * current component render. Used in static shell validation where we need
+ * React to call onError so the error is tracked via trackDynamicHoleInNavigation.
+ */
+export function abortAndThrowOnSynchronousPlatformIOAccess(
+  route: string,
+  expression: string,
+  errorWithStack: Error,
+  prerenderStore: PrerenderStoreModern
+): never {
+  abortOnSynchronousPlatformIOAccess(
+    route,
+    expression,
+    errorWithStack,
+    prerenderStore
+  )
+  throw createPrerenderInterruptedError(
+    `Route ${route} needs to bail out of prerendering at this point because it used ${expression}.`
+  )
+}
+
+/**
  * use this function when prerendering with cacheComponents. If we are doing a
  * prospective prerender we don't actually abort because we want to discover
  * all caches for the shell. If this is the actual prerender we do abort.
@@ -793,11 +815,20 @@ export type InstantValidationState = {
   validationPreventingErrors: Array<Error>
   thrownErrorsOutsideBoundary: Array<unknown>
   createInstantStack: (() => Error) | null
+  isStaticShellValidation: boolean
+  allowEmptyStaticShell: boolean
+  hasSuspenseAboveBody: boolean
 }
 
-export function createInstantValidationState(
+export function createInstantValidationState({
+  createInstantStack,
+  isStaticShellValidation,
+  allowEmptyStaticShell,
+}: {
   createInstantStack: (() => Error) | null
-): InstantValidationState {
+  isStaticShellValidation: boolean
+  allowEmptyStaticShell: boolean
+}): InstantValidationState {
   return {
     hasDynamicMetadata: false,
     hasAllowedClientDynamicAboveBoundary: false,
@@ -808,6 +839,9 @@ export function createInstantValidationState(
     validationPreventingErrors: [],
     thrownErrorsOutsideBoundary: [],
     createInstantStack,
+    isStaticShellValidation,
+    allowEmptyStaticShell,
+    hasSuspenseAboveBody: false,
   }
 }
 
@@ -845,6 +879,49 @@ export function trackDynamicHoleInNavigation(
     const message = `Route "${workStore.route}": ${usageDescription} This delays the entire page from rendering, resulting in a slow user experience. Learn more: https://nextjs.org/docs/messages/next-prerender-dynamic-viewport`
     const error = addErrorContext(
       new Error(message),
+      componentStack,
+      dynamicValidation.createInstantStack
+    )
+    dynamicValidation.dynamicErrors.push(error)
+    return
+  }
+
+  // Static shell validation-specific checks: when validating the static shell
+  // via instant validation, the entire tree is "new" (navigationParent = null),
+  // so there's no concept of shared parent vs new segment. All dynamic access
+  // is evaluated against Suspense boundaries only, not validation boundaries.
+  if (dynamicValidation.isStaticShellValidation) {
+    if (
+      hasSuspenseBeforeRootLayoutWithoutBodyOrImplicitBodyRegex.test(
+        componentStack
+      )
+    ) {
+      dynamicValidation.hasAllowedDynamic = true
+      dynamicValidation.hasSuspenseAboveBody = true
+      return
+    }
+    if (hasSuspenseRegex.test(componentStack)) {
+      dynamicValidation.hasAllowedDynamic = true
+      return
+    }
+    // No Suspense found. In static shell validation, this is a blocking error.
+    // Check for sync IO (Date.now, Math.random, etc.) which sets a specific
+    // error on the dynamic tracking state.
+    if (clientDynamic.syncDynamicErrorWithStack) {
+      const syncError = clientDynamic.syncDynamicErrorWithStack
+      if (
+        dynamicValidation.createInstantStack !== null &&
+        syncError.cause === undefined
+      ) {
+        syncError.cause = dynamicValidation.createInstantStack()
+      }
+      dynamicValidation.dynamicErrors.push(syncError)
+      return
+    }
+    // Generic blocking error for non-sync-IO dynamic access in SSV.
+    const message = `Route "${workStore.route}": Dynamic access was detected outside of \`<Suspense>\`. This delays the entire page from rendering, resulting in a slow user experience. Learn more: https://nextjs.org/docs/messages/blocking-route`
+    const error = createErrorWithComponentOrOwnerStack(
+      message,
       componentStack,
       dynamicValidation.createInstantStack
     )
@@ -1223,6 +1300,52 @@ export function getNavigationDisallowedDynamicReasons(
   dynamicValidation: InstantValidationState,
   boundaryState: ValidationBoundaryTracking
 ): Array<Error> {
+  // Static shell validation checks the HTML shell (prelude) and any errors
+  // tracked during the SSR render. The rendering uses cached RSC data, so
+  // server-side dynamic access (cookies, headers) is not re-triggered during
+  // SSR. Detectable static shell validation errors are:
+  //
+  // 1. Client-side sync IO (Date.now, Math.random, crypto) — aborts the
+  //    controller. The component may finish rendering synchronously, producing
+  //    a full prelude, but the abort is tracked via syncDynamicErrorWithStack
+  //    and pushed to dynamicErrors by trackDynamicHoleInNavigation.
+  //
+  // 2. Dynamic viewport metadata (generateViewport accessing cookies etc.) —
+  //    tracked in dynamicMetadata.
+  //
+  // hasSuspenseAboveBody is only set when a sync IO violation triggers
+  // tracking with Suspense above the body — if there's no sync IO, it stays
+  // false, but the empty prelude is still valid.
+  if (dynamicValidation.isStaticShellValidation) {
+    if (dynamicValidation.hasSuspenseAboveBody) {
+      return []
+    }
+    if (dynamicValidation.allowEmptyStaticShell) {
+      return []
+    }
+
+    // Check for sync IO errors (tracked in dynamicErrors). These can occur
+    // even when the prelude is full because the component renders
+    // synchronously before React detects the abort.
+    if (dynamicValidation.dynamicErrors.length > 0) {
+      return dynamicValidation.dynamicErrors
+    }
+
+    if (prelude === PreludeState.Full) {
+      // Full prelude: the static shell exists. Check for dynamic viewport
+      // metadata that would prevent the shell from including proper <head>.
+      if (
+        dynamicValidation.hasAllowedDynamic === false &&
+        dynamicValidation.dynamicMetadata
+      ) {
+        return [dynamicValidation.dynamicMetadata]
+      }
+      return []
+    }
+
+    return []
+  }
+
   const { validationPreventingErrors } = dynamicValidation
   if (validationPreventingErrors.length > 0) {
     return validationPreventingErrors
