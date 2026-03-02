@@ -276,7 +276,7 @@ export const getPost = cache(async (id) => {
 
 When you fetch data in Server Components, the data is fetched and rendered on the server for each request. If you have any slow data requests, the whole route will be blocked from rendering until all the data is fetched.
 
-To improve the initial load time and user experience, you can use streaming to break up the page's HTML into smaller chunks and progressively send those chunks from the server to the client.
+To improve the initial load time and user experience, you can use streaming to break up the page's HTML into smaller chunks and progressively send those chunks from the server to the client. See the [Streaming guide](/docs/app/guides/streaming) for a comprehensive overview of how streaming works, including the HTTP contract, infrastructure considerations, and trade-offs.
 
 <Image
   alt="How Server Rendering with Streaming Works"
